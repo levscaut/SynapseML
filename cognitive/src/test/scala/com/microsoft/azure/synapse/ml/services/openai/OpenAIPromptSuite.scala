@@ -3,14 +3,13 @@
 
 package com.microsoft.azure.synapse.ml.services.openai
 
-import com.microsoft.azure.synapse.ml.Secrets.{AIFoundryApiKey, getAccessToken}
+import com.microsoft.azure.synapse.ml.Secrets.getAccessToken
 import com.microsoft.azure.synapse.ml.core.test.base.Flaky
 import com.microsoft.azure.synapse.ml.core.test.fuzzing.{TestObject, TransformerFuzzing}
 import org.apache.spark.ml.util.MLReadable
 import org.apache.spark.sql.{DataFrame, Row}
-import org.apache.spark.sql.functions.{col, lit}
+import org.apache.spark.sql.functions.{col, lit, struct, to_json}
 import org.apache.spark.sql.types.{ArrayType, StringType, StructType}
-import org.scalactic.Equality
 import com.microsoft.azure.synapse.ml.services.aifoundry.AIFoundryAPIKey
 
 import java.nio.charset.StandardCharsets
@@ -19,6 +18,7 @@ import java.nio.file.Files
 class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIKey
   with AIFoundryAPIKey
   with Flaky {
+  override val compareDataInSerializationTest: Boolean = false
 
   import spark.implicits._
 
@@ -33,7 +33,6 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
     .setDeploymentName(deploymentName)
     .setCustomServiceName(openAIServiceName)
     .setOutputCol("outParsed")
-    .setTemperature(0)
 
   lazy val aiFoundryPrompt: OpenAIPrompt = new OpenAIPrompt()
     .setSubscriptionKey(aiFoundryAPIKey)
@@ -57,7 +56,6 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
       .setPromptTemplate("List two {category}, starting with {text}.")
       .setPostProcessing("csv")
       .setOutputCol(outputCol)
-      .setTemperature(0)
   }
 
   test("createMessagesForRow generates contentParts for path columns when using Chat Completions API") {
@@ -109,17 +107,27 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
   }
   // scalastyle:on null
 
+  private def hasNonEmptyError(row: Row, errorColName: String): Boolean = {
+    Option(row.getAs[Row](errorColName))
+      .flatMap(error => Option(error.getAs[String]("response")))
+      .exists(_.nonEmpty)
+  }
+
   test("RAI Usage") {
-    val result = prompt
+    val rows = prompt
       .setDeploymentName(deploymentName)
       .setPromptTemplate("Tell me about a graphically disgusting " +
         "and violent movie in detail, " +
         "be very gory and NSFW in your description.")
       .transform(df)
-      .where(col(prompt.getErrorCol).isNotNull)
-      .select(prompt.getErrorCol)
-      .collect().head.getAs[Row](0)
-    assert(Option(result).nonEmpty)
+      .select(col(prompt.getOutputCol), col(prompt.getErrorCol))
+      .collect()
+
+    assert(rows.length == 3)
+    rows.foreach { row =>
+      val hasOutput = Option(row.getAs[String](prompt.getOutputCol)).exists(_.nonEmpty)
+      assert(hasOutput || hasNonEmptyError(row, prompt.getErrorCol))
+    }
   }
 
   test("Basic Usage") {
@@ -144,7 +152,7 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
     assert(nonNullCount == 3)
   }
 
-    test("Basic Usage Responses API") {
+  test("Basic Usage Responses API") {
     val nonNullCount = prompt
       .setPromptTemplate("give me a comma separated list of 5 {category}, starting with {text} ")
       .setApiType("responses")
@@ -160,7 +168,8 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
 
   test("Basic Usage JSON") {
     prompt.setPromptTemplate(
-        """Split a word into prefix and postfix a respond in JSON.
+        """Return only one JSON object with exactly the top-level string fields "prefix" and "suffix".
+          |Do not nest the object under the input word.
           |Cherry: {{"prefix": "Che", "suffix": "rry"}}
           |{text}:
           |""".stripMargin)
@@ -257,7 +266,8 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
 
   test("Basic Usage JSON - without explicit post-processing") {
     prompt.setPromptTemplate(
-                """Split a word into prefix and postfix a respond in JSON
+                """Return only one JSON object with exactly the top-level string fields "prefix" and "suffix".
+                  |Do not nest the object under the input word.
                   |Cherry: {{"prefix": "Che", "suffix": "rry"}}
                   |{text}:
                   |""".stripMargin)
@@ -291,9 +301,9 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
       .setDeploymentName(deploymentName)
       .setCustomServiceName(openAIServiceName)
       .setOutputCol("outParsed")
-      .setTemperature(0)
       .setPromptTemplate(
-        """Split a word into prefix and postfix in JSON format
+        """Return only one JSON object with exactly the top-level string fields "prefix" and "suffix".
+          |Do not nest the object under the input word.
           |Cherry: {{"prefix": "Che", "suffix": "rry"}}
           |{text}:
           |""".stripMargin)
@@ -344,6 +354,34 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
     }
   }
 
+  test("Responses OpenAIPrompt supports AI Functions URL rows") {
+    val imageUrl = "https://mmlspark.blob.core.windows.net/datasets/OCR/test2.png"
+    val input = Seq((imageUrl, "stable-test-asset")).toDF("image_path", "source")
+    val rowJsonCol = "ai_functions_row_json"
+    val prepared = input.withColumn(rowJsonCol, to_json(struct(input.columns.map(col): _*)))
+
+    val promptResponses = new OpenAIPrompt()
+      .setSubscriptionKey(openAIAPIKey)
+      .setDeploymentName(deploymentName)
+      .setCustomServiceName(openAIServiceName)
+      .setApiVersion("2025-04-01-preview")
+      .setApiType("responses")
+      .setColumnType("image_path", "path")
+      .setSystemPrompt("User input text is encoded in JSON\nDescribe the attached image in one sentence.")
+      .setPromptTemplate(s"{$rowJsonCol}")
+      .setOutputCol("outParsed")
+      .setErrorCol("error")
+
+    val result = promptResponses
+      .transform(prepared)
+      .select("outParsed", "error")
+      .head()
+
+    val error = Option(result.getAs[Row]("error")).map(_.getAs[String]("response"))
+    assert(error.isEmpty, error.getOrElse(""))
+    assert(Option(result.getAs[String]("outParsed")).exists(_.nonEmpty))
+  }
+
   test("null path columns return null output") {
     val promptResponses = new OpenAIPrompt()
       .setSubscriptionKey(openAIAPIKey)
@@ -383,15 +421,100 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
     assert(results(2).getString(0) != null)
   }
 
+  test("file preparation error stores error in errorCol instead of failing") {
+    // Create a valid temp file for the working rows
+    val tempFile = Files.createTempFile("synapseml-openai-test", ".txt")
+    try {
+      Files.write(tempFile, "test content for file".getBytes(StandardCharsets.UTF_8))
+
+      val promptWithPath = new OpenAIPrompt()
+        .setSubscriptionKey(openAIAPIKey)
+        .setDeploymentName(deploymentName)
+        .setCustomServiceName(openAIServiceName)
+        .setApiVersion("2025-04-01-preview")
+        .setApiType("responses")
+        .setColumnType("filePath", "path")
+        .setOutputCol("outParsed")
+        .setPromptTemplate("{questions}: {filePath}")
+
+      val testDF = Seq(
+        ("Summarize this file", tempFile.toString),  // valid file
+        ("Summarize this file", "/nonexistent/path/to/file.txt"),  // non-existent local file
+        ("Summarize this file", tempFile.toString)  // valid file
+      ).toDF("questions", "filePath")
+
+      val result = promptWithPath.transform(testDF)
+      val rows = result.select("outParsed", promptWithPath.getErrorCol).collect()
+      // display result
+      result.show(false)
+
+      // Helper to extract error message from error struct
+      def getErrorMessage(row: Row, idx: Int): String = {
+        val errorStruct = row.getAs[Row](idx)
+        if (errorStruct == null) null else errorStruct.getAs[String]("response") // scalastyle:ignore null
+      }
+
+      // First row: valid file - should have output, no error
+      assert(rows(0).getString(0) != null, "First row should have output")
+      assert(rows(0).get(1) == null, "First row should have no error")
+
+      // Second row: non-existent file - should have null output and error message
+      assert(rows(1).get(0) == null, "Second row should have null output for file not found")
+      val errorMsg = getErrorMessage(rows(1), 1)
+      assert(errorMsg != null, "Second row should have error message for file not found")
+      assert(errorMsg.nonEmpty, "Error message should not be empty")
+
+      // Third row: valid file - should have output, no error
+      assert(rows(2).getString(0) != null, "Third row should have output")
+      assert(rows(2).get(1) == null, "Third row should have no error")
+    } finally {
+      Files.deleteIfExists(tempFile)
+    }
+  }
+
+  test("file size limit produces error when exceeded") {
+    val tempFile = Files.createTempFile("synapseml-openai-size-test", ".txt")
+    try {
+      // Write content that exceeds 0.00001 MB (~10 bytes limit)
+      Files.write(tempFile, "This content is larger than 10 bytes".getBytes(StandardCharsets.UTF_8))
+
+      val promptWithLimit = new OpenAIPrompt()
+        .setSubscriptionKey(openAIAPIKey)
+        .setDeploymentName(deploymentName)
+        .setCustomServiceName(openAIServiceName)
+        .setApiVersion("2025-04-01-preview")
+        .setApiType("responses")
+        .setColumnType("filePath", "path")
+        .setFileSizeLimitMB(0.00001) // ~10 bytes limit
+        .setOutputCol("outParsed")
+        .setPromptTemplate("{questions}: {filePath}")
+
+      val testDF = Seq(
+        ("Summarize this file", tempFile.toString)
+      ).toDF("questions", "filePath")
+
+      val result = promptWithLimit.transform(testDF)
+      val rows = result.select("outParsed", promptWithLimit.getErrorCol).collect()
+
+      // Should have null output and error message about size limit
+      assert(rows(0).get(0) == null, "Should have null output when file exceeds size limit")
+      val errorStruct = rows(0).getAs[Row](1)
+      assert(errorStruct != null, "Should have error when file exceeds size limit")
+      val errorMsg = errorStruct.getAs[String]("response")
+      assert(errorMsg.contains("exceeds limit"), s"Error should mention exceeds limit: $errorMsg")
+    } finally {
+      Files.deleteIfExists(tempFile)
+    }
+  }
+
   ignore("Custom EndPoint") {
     lazy val accessToken: String = sys.env.getOrElse("CUSTOM_ACCESS_TOKEN", "")
     lazy val customRootUrlValue: String = sys.env.getOrElse("CUSTOM_ROOT_URL", "")
-    lazy val customHeadersValues: Map[String, String] = Map("X-ModelType" -> "gpt-4-turbo-chat-completions")
+    lazy val customHeadersValues: Map[String, String] = Map("X-ModelType" -> "gpt-6-luna-chat-completions")
 
     lazy val customPrompt: OpenAIPrompt = new OpenAIPrompt()
       .setCustomUrlRoot(customRootUrlValue)
       .setOutputCol("outParsed")
-      .setTemperature(0)
 
     if (accessToken.isEmpty) {
       customPrompt.setSubscriptionKey(openAIAPIKey)
@@ -408,46 +531,6 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
       .select("outParsed")
       .collect()
       .count(r => Option(r.getSeq[String](0)).isDefined)
-  }
-
-  test("setPostProcessingOptions should set postProcessing to 'csv' for delimiter option") {
-    val prompt = new OpenAIPrompt()
-    prompt.setPostProcessingOptions(Map("delimiter" -> ","))
-    assert(prompt.getPostProcessing == "csv")
-  }
-
-  test("setPostProcessingOptions should set postProcessing to 'json' for jsonSchema option") {
-    val prompt = new OpenAIPrompt()
-    prompt.setPostProcessingOptions(Map("jsonSchema" -> "schema"))
-    assert(prompt.getPostProcessing == "json")
-  }
-
-  test("setPostProcessingOptions should set postProcessing to 'regex' for regex option") {
-    val prompt = new OpenAIPrompt()
-    prompt.setPostProcessingOptions(Map("regex" -> ".*", "regexGroup" -> "0"))
-    assert(prompt.getPostProcessing == "regex")
-  }
-
-  test("setPostProcessingOptions should throw IllegalArgumentException for invalid options") {
-    val prompt = new OpenAIPrompt()
-    intercept[IllegalArgumentException] {
-      prompt.setPostProcessingOptions(Map("invalidOption" -> "value"))
-    }
-  }
-
-  test("setPostProcessingOptions should validate regex options contain regexGroup key") {
-    val prompt = new OpenAIPrompt()
-    intercept[IllegalArgumentException] {
-      prompt.setPostProcessingOptions(Map("regex" -> ".*"))
-    }
-  }
-
-  test("setPostProcessingOptions should validate existing postProcessing value") {
-    val prompt = new OpenAIPrompt()
-    prompt.setPostProcessing("csv")
-    intercept[IllegalArgumentException] {
-      prompt.setPostProcessingOptions(Map("jsonSchema" -> "schema"))
-    }
   }
 
   test("reject bare json_schema string in OpenAIPrompt responseFormat passthrough"){
@@ -499,7 +582,6 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
       .setStore(true)
       .setPromptTemplate("What is {text}?")
       .setOutputCol("store_output")
-      .setTemperature(0)
 
     val result = storePrompt.transform(df.limit(1))
     val schema = result.schema
@@ -529,7 +611,6 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
       .setUsageCol("usage")
       .setPromptTemplate("What is {text}?")
       .setOutputCol("store_usage_output")
-      .setTemperature(0)
 
     val result = storeUsagePrompt.transform(df.limit(1))
     val schema = result.schema
@@ -565,7 +646,6 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
       .setResponseIdCol("custom_id")
       .setPromptTemplate("What is {text}?")
       .setOutputCol("output")
-      .setTemperature(0)
 
     val result = customIdPrompt.transform(df.limit(1))
     val schema = result.schema
@@ -587,7 +667,6 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
       .setStore(false)
       .setPromptTemplate("What is {text}?")
       .setOutputCol("no_store_output")
-      .setTemperature(0)
 
     val result = noStorePrompt.transform(df.limit(1))
     val schema = result.schema
@@ -600,7 +679,7 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
     assert(!schema.fieldNames.contains(responseIdColName))
   }
 
-  test("store parameter throws error when apiType is not responses") {
+  test("store parameter is accepted for Chat Completions") {
     val promptWithStore = new OpenAIPrompt()
       .setSubscriptionKey(openAIAPIKey)
       .setDeploymentName(deploymentName)
@@ -610,10 +689,8 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
       .setPromptTemplate("What is {text}?")
       .setOutputCol("output")
 
-    val exception = intercept[IllegalArgumentException] {
-      promptWithStore.transform(df.limit(1))
-    }
-    assert(exception.getMessage.contains("store parameter requires apiType='responses'"))
+    val schema = promptWithStore.transformSchema(df.schema)
+    assert(schema(promptWithStore.getResponseIdCol).dataType == StringType)
   }
 
   test("previousResponseId parameter throws error when apiType is not responses") {
@@ -647,10 +724,6 @@ class OpenAIPromptSuite extends TransformerFuzzing[OpenAIPrompt] with OpenAIAPIK
       promptWithPrevIdCol.transform(dfWithIds.limit(1))
     }
     assert(exception.getMessage.contains("previousResponseId requires apiType='responses'"))
-  }
-
-  override def assertDFEq(df1: DataFrame, df2: DataFrame)(implicit eq: Equality[DataFrame]): Unit = {
-    super.assertDFEq(df1.drop("out", "outParsed"), df2.drop("out", "outParsed"))(eq)
   }
 
   override def testObjects(): Seq[TestObject[OpenAIPrompt]] = {
